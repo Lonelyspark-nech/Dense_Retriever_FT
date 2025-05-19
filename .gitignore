@@ -1,0 +1,17 @@
+# 忽略大目录和缓存
+datasets/
+checkpoints/
+cache/
+ir_cache_top10/
+.ipynb_checkpoints/
+__pycache__/
+
+# 常见大文件类型
+*.pt
+*.bin
+*.npy
+*.npz
+*.safetensors
+*.tar
+*.tar.gz
+*.zip
