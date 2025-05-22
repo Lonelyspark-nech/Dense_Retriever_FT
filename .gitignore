@@ -5,6 +5,7 @@ cache/
 ir_cache_top10/
 .ipynb_checkpoints/
 __pycache__/
+outputs/
 
 # 常见大文件类型
 *.pt

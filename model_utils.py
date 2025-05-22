@@ -28,8 +28,9 @@ def build_model_and_tokenizer(
     lora_config=default_lora_config,
     lora_path=None,
     use_bf16=True,
-    device_map="auto"
+    device="cuda",
 ):
+    
     """
     加载基础 LLaMA 模型和 Tokenizer，如果指定了 LoRA adapter 路径则加载 adapter。
     返回 PEFT 模型和 tokenizer。
@@ -39,12 +40,19 @@ def build_model_and_tokenizer(
 
     model = AutoModel.from_pretrained(
         base_model_name,
-        torch_dtype=torch.bfloat16 if use_bf16 else torch.float32,
-        device_map=device_map
+        torch_dtype=torch.bfloat16
     )
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable()
+    model.to(device)
 
     if lora_path:
-        model = PeftModel.from_pretrained(model, lora_path)  # 加载已有 adapter 权重
+        model = PeftModel.from_pretrained(model, lora_path, is_trainable=True)
+
+        for name, param in model.named_parameters():
+            if "lora" in name and not param.requires_grad:
+                print(f"[⚠️] Warning: {name} still has requires_grad=False, forcing it True")
+                param.requires_grad = True
         print(f"[✓] Loaded LoRA adapter from {lora_path}")
     else:
         model = get_peft_model(model, lora_config)  # 注入新的 LoRA 层
@@ -59,69 +67,63 @@ def encode_with_eos(
     tokenizer: PreTrainedTokenizer,
     texts: List[str],
     max_length: int = 512,
-    batch_size: int = 32,
-    prefix: str = "",
+    batch_size: int = 1,
+    prefix: Optional[str] = None,
     device: Union[str, torch.device] = "cuda",
     dtype: torch.dtype = torch.float16,
     no_grad: bool = True,
 ) -> np.ndarray:
+    # —— 1. 切换模式 & 移动模型
     if no_grad:
         model.eval()
-    model.to(device=model.device, dtype=model.dtype)
-    
-    def _encode_batch(batch):
-        assert all(len(t.strip()) > 0 for t in batch), "[❌] Found empty string in input batch!"
+    else:
+        model.train()
+    model.to(device=device, dtype=model.dtype)
+
+    # —— 2. 定义单次前向的内部函数
+    def _encode_batch(batch: List[str]):
+        assert all(len(t.strip()) > 0 for t in batch), "[❌] Found empty string!"
         inputs = tokenizer(
-            [prefix + t + tokenizer.eos_token for t in batch],
-            padding=True,
-            truncation=True,
-            max_length=max_length,
+            [(prefix or "") + t + tokenizer.eos_token for t in batch],
+            padding=True, truncation=True, max_length=max_length,
             return_tensors="pt"
         )
-        inputs = {k: v.to(device=device) for k, v in inputs.items()}
-
-        with torch.no_grad() if no_grad else contextlib.nullcontext():
+        inputs = {k: v.to(device=device) for k,v in inputs.items()}
+        ctx = torch.no_grad() if no_grad else contextlib.nullcontext()
+        with ctx:
             outputs = model(**inputs, return_dict=True)
-            last_hidden_state = outputs.last_hidden_state
-
+        last_hidden = outputs.last_hidden_state
         lengths = inputs["attention_mask"].sum(dim=1) - 1
-        pooled = torch.stack([
-            last_hidden_state[i, l] if l < last_hidden_state.size(1) else torch.zeros_like(last_hidden_state[i, 0])
-            for i, l in enumerate(lengths)
-        ])
+        pooled = torch.stack([ last_hidden[i, l] if l < last_hidden.size(1)
+                               else torch.zeros_like(last_hidden[i,0])
+                               for i,l in enumerate(lengths) ])
+        return pooled.detach().cpu().to(torch.float32).numpy() if no_grad else pooled
 
-        if no_grad:
-            return pooled.detach().cpu().to(torch.float32).numpy()
-        else:
-            return pooled  # 保留计算图
+    # —— 3. 训练时一次性全批前向，避免分块多图 OOM
+    if not no_grad:
+        return _encode_batch(texts)
 
-    all_vecs = []
-    i = 0
-    last_successful_bs = batch_size
-
+    # —— 验证/缓存时的原分块逻辑
+    all_vecs, i, last_bs = [], 0, batch_size
     while i < len(texts):
-        bs = last_successful_bs
+        bs = last_bs
         while bs >= 1:
             try:
-                batch = texts[i:i+bs]
-                vecs = _encode_batch(batch)
+                vecs = _encode_batch(texts[i:i+bs])
                 all_vecs.append(vecs)
                 i += bs
-                last_successful_bs = bs
+                last_bs = bs
                 break
             except RuntimeError as e:
-                if "out of memory" in str(e):
+                if "out of memory" in str(e).lower():
                     torch.cuda.empty_cache()
                     bs //= 2
                 else:
-                    raise e
+                    raise
         if bs < 1:
             raise RuntimeError(f"OOM at index {i}, even with batch_size=1")
 
-    if no_grad:
-        return np.concatenate(all_vecs, axis=0)
-    else:
-        return torch.cat(all_vecs, dim=0)
+    return np.concatenate(all_vecs, axis=0)
 
 
 
@@ -139,18 +141,26 @@ def apply_pca(name: str, vecs: np.ndarray, pca_path, cache_dir: Path) -> np.ndar
 
         if name == "corpus":
             if vecs.shape[0] < pca_path:
-                print(f"[⚠️] Too few corpus samples ({vecs.shape[0]}) for PCA={pca_path}, skipping PCA.")
+                print(f"Too few corpus samples ({vecs.shape[0]}) for PCA={pca_path}, skipping PCA.")
                 skipped_flag_path.touch()
                 return vecs
             else:
-                print(f"[🔍] Training PCA on corpus to {pca_path} dims...")
+                print(f"Training PCA on corpus to {pca_path} dims...")
                 pca = PCA(n_components=pca_path)
+
+                std_before_pca = vecs.std()
+                
                 vecs = pca.fit_transform(vecs)
+
+                std_after_pca = vecs.std()
+                print(f"corpus PCA trained: std before={std_before_pca:.6f}, after={std_after_pca:.6f}")
+
+                
                 dump(pca, shared_pca_path)
-                print(f"[💾] Saved shared PCA model to {shared_pca_path}")
+                print(f"Saved shared PCA model to {shared_pca_path}")
                 if skipped_flag_path.exists():
                     skipped_flag_path.unlink()
-                    print(f"[🧹] Removed old PCA skipped flag: {skipped_flag_path}")
+                    print(f"Removed old PCA skipped flag: {skipped_flag_path}")
                 return vecs
 
         else:
@@ -166,20 +176,24 @@ def apply_pca(name: str, vecs: np.ndarray, pca_path, cache_dir: Path) -> np.ndar
                         f"[❌] Shared PCA model {shared_pca_path} not found. "
                         f"Did you run corpus encoding first?"
                     )
-            print(f"[🔁] Loading shared PCA model from {shared_pca_path}")
+            print(f"Loading shared PCA model from {shared_pca_path}")
             pca = load(shared_pca_path)
-            return pca.transform(vecs)
+            std_before_pca = vecs.std()
+            vecs = pca.transform(vecs)
+            std_after_pca = vecs.std()
+            print(f"{name} PCA applied: std before={std_before_pca:.6f}, after={std_after_pca:.6f}")
+            return vecs
 
     elif isinstance(pca_path, str):
         pca_model_path = Path(pca_path)
         if not pca_model_path.exists():
             raise FileNotFoundError(f"[❌] PCA model not found at: {pca_model_path}")
-        print(f"[🔁] Loading PCA model from {pca_model_path}")
+        print(f"Loading PCA model from {pca_model_path}")
         pca = load(pca_model_path)
         return pca.transform(vecs)
 
     elif pca_path is None:
-        print("[ℹ️] PCA disabled: using original vector dimension.")
+        print("PCA disabled: using original vector dimension.")
         return vecs
 
     else:
@@ -194,7 +208,7 @@ def encode_and_cache(
     cache_dir: Union[str, Path],
     max_length: int = 512,
     batch_size: int = 128,
-    prefix: str = "passage: ",
+    prefix: str = "",
     pca_path: Optional[Union[int, str]] = None,
     normalize: bool = True,
     rebuild: bool = False
@@ -209,12 +223,12 @@ def encode_and_cache(
 
     if cache_path.exists() and not rebuild:
         vecs = np.load(cache_path)
-        print(f"[✅] Loaded cached vectors: {cache_path}")
+        print(f"Loaded cached vectors: {cache_path}")
     else:
         vecs = []
-        model.to(device=model.device, dtype=model.dtype)
+        # model.to(device=model.device, dtype=model.dtype)
         
-        print(f"[🧠] Encoding {len(texts)} texts with batch size {batch_size}...")
+        print(f"Encoding {len(texts)} texts with batch size {batch_size}...")
         for i in tqdm(range(0, len(texts), batch_size)):
             batch = texts[i:i+batch_size]
             with torch.no_grad():
@@ -226,26 +240,36 @@ def encode_and_cache(
                     batch_size=batch_size,
                     prefix=prefix
                 )
-            for idx, v in enumerate(encoded):
-                norm = np.linalg.norm(v)
-                if np.isnan(v).any():
-                    raise ValueError(f"NaN in vector at index {i + idx}: {ids[i + idx]}")
-                if norm < 1e-6:
-                    raise ValueError(f"Zero vector at index {i + idx}: {ids[i + idx]}")
+            # for idx, v in enumerate(encoded):
+            #     norm = np.linalg.norm(v)
+            #     if np.isnan(v).any():
+            #         raise ValueError(f"NaN in vector at index {i + idx}: {ids[i + idx]}")
+            #     if norm < 1e-6:
+            #         raise ValueError(f"Zero vector at index {i + idx}: {ids[i + idx]}")
             vecs.append(encoded)
 
         vecs = np.concatenate(vecs, axis=0)
 
-        if pca_path is not None:
-            vecs = apply_pca(name, vecs, pca_path, cache_dir)
+        # norms = np.linalg.norm(vecs, axis=1)
+        # print(f"{name} norm: min={norms.min():.4f}, max={norms.max():.4f}, mean={norms.mean():.4f}")
+        # print(f"{name} vector stats (after encode): mean={vecs.mean():.6f}, std={vecs.std():.6f}")
+        
+        # std_before_pca = vecs.std()
+
+        # if pca_path is not None:
+        #     vecs = apply_pca(name, vecs, pca_path, cache_dir)
+
+        # std_after_pca = vecs.std()
+        # print(f"[🧪] PCA effect on {name}: std before={std_before_pca:.6f}, after={std_after_pca:.6f}")
+
 
         if normalize:
-            print("[📏] Normalizing vectors...")
+            print("Normalizing vectors...")
             norms = np.linalg.norm(vecs, axis=1, keepdims=True)
             vecs = vecs / norms
 
         np.save(cache_path, vecs)
-        print(f"[💾] Saved vectors to {cache_path}")
+        print(f"Saved vectors to {cache_path}")
 
     return vecs
 
@@ -260,19 +284,19 @@ def build_faiss_index(
         print(f"[✅] Loading FAISS index from {index_path}")
         return faiss.read_index(str(index_path))
 
-    print("[🏗️] Building FAISS IVF index...")
+    print("Building FAISS IVF index...")
     d = vecs.shape[1]
     quantizer = faiss.IndexFlatIP(d)
     index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
     
-    faiss.normalize_L2(vecs)
+    # faiss.normalize_L2(vecs)
     assert index.is_trained == False
     index.train(vecs)
     index.add(vecs.astype(np.float32))
 
     if index_path is not None:
         faiss.write_index(index, str(index_path))
-        print(f"[💾] Saved FAISS index to {index_path}")
+        print(f"Saved FAISS index to {index_path}")
 
     return index
 

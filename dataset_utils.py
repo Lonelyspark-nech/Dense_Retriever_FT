@@ -32,8 +32,9 @@ class TripletDataset(Dataset):
             'negatives': sampled_negs
         }
 
-def load_triplets_with_padding(filepath, min_negatives=1):
+def load_triplets_with_padding(filepath, corpus_ids,corpus_texts, min_negatives=1):
     triplets = []
+    corpus_dict = dict(zip(corpus_ids, corpus_texts))
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             data = json.loads(line)
@@ -42,7 +43,8 @@ def load_triplets_with_padding(filepath, min_negatives=1):
             if "negative_ids" in data:
                 query = data["query"]
                 positive = data["positive"]
-                negatives = data.get("negative_ids", [])
+                negative_ids = data.get("negative_ids",[])
+                negatives= [corpus_dict[nid] for nid in negative_ids if nid in corpus_dict]
             else:
                 # 保留旧结构兼容性
                 query = data["query"]
@@ -58,10 +60,9 @@ def load_triplets_with_padding(filepath, min_negatives=1):
                 "positive": positive,
                 "negatives": negatives
             })
-    print(f"[✓] Loaded {len(triplets)} triplets from {filepath}")
+    print(f"Loaded {len(triplets)} triplets from {filepath}")
     return triplets
 
-    
 def load_retrieval_dataset(query_path, qrels_path, corpus_path):
     """
     加载验证集或测试集所需的数据结构，包含 query, corpus, qrels 映射字典。
